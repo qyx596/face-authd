@@ -1,4 +1,8 @@
 # face-authd
+[![Release](https://img.shields.io/github/v/release/qyx596/face-authd?display_name=tag)](https://github.com/qyx596/face-authd/releases)
+[![License](https://img.shields.io/github/license/qyx596/face-authd)](https://github.com/qyx596/face-authd/blob/main/LICENSE)
+[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux-blue.svg)](https://www.kernel.org/)
 
 Rust-based local face authentication for Linux via PAM.
 
