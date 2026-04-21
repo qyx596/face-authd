@@ -1,0 +1,23 @@
+[Unit]
+Description=Local face authentication daemon
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/face-authd
+Restart=on-failure
+RuntimeDirectory=face-authd
+RuntimeDirectoryMode=0755
+StateDirectory=face-authd
+StateDirectoryMode=0700
+Environment=RUST_LOG=info
+
+# 正式部署时应进一步收紧权限。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run /var/lib/face-authd
+
+[Install]
+WantedBy=multi-user.target

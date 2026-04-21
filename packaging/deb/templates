@@ -1,0 +1,9 @@
+Template: face-authd/configure_pam
+Type: boolean
+Default: false
+Description: Automatically configure PAM for face-authd?
+ If enabled, the installer will insert a managed pam_face_auth.so block into:
+  - /etc/pam.d/sudo
+  - /etc/pam.d/gdm-password (if present)
+ .
+ Existing files are backed up once with a .bak.face-authd suffix.

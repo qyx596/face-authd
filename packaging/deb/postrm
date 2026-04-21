@@ -1,0 +1,35 @@
+#!/bin/sh
+set -e
+
+PAM_BLOCK_START="# >>> face-authd managed block >>>"
+PAM_BLOCK_END="# <<< face-authd managed block <<<"
+
+remove_pam_block() {
+    file="$1"
+    [ -f "$file" ] || return 0
+    tmp="$(mktemp)"
+    awk -v start="$PAM_BLOCK_START" -v end="$PAM_BLOCK_END" '
+        $0 == start { skip=1; next }
+        $0 == end   { skip=0; next }
+        !skip       { print }
+    ' "$file" >"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+}
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    # Remove managed PAM entries to avoid stale pam_face_auth.so references after uninstall.
+    remove_pam_block /etc/pam.d/sudo
+    remove_pam_block /etc/pam.d/gdm-password
+
+    # User requested cleanup: remove all persisted face-authd data (embeddings/models).
+    if [ -d /var/lib/face-authd ]; then
+        rm -rf /var/lib/face-authd
+    fi
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+
+exit 0

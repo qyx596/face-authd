@@ -1,0 +1,6 @@
+[devices."/dev/video0"]
+controls = [
+  { name = "Auto Exposure", value = 1 },
+  { name = "Exposure Time, Absolute", value = 300 },
+  { name = "Exposure, Dynamic Framerate", value = false },
+]

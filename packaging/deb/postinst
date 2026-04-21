@@ -1,0 +1,66 @@
+#!/bin/sh
+set -e
+
+PAM_BLOCK_START="# >>> face-authd managed block >>>"
+PAM_BLOCK_END="# <<< face-authd managed block <<<"
+PAM_LINE="auth sufficient pam_face_auth.so"
+
+backup_once() {
+    file="$1"
+    backup="${file}.bak.face-authd"
+    if [ -f "$file" ] && [ ! -f "$backup" ]; then
+        cp -a "$file" "$backup"
+    fi
+}
+
+add_pam_block() {
+    file="$1"
+    [ -f "$file" ] || return 0
+
+    if grep -Fq "$PAM_BLOCK_START" "$file"; then
+        return 0
+    fi
+
+    backup_once "$file"
+    tmp="$(mktemp)"
+    inserted=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$inserted" -eq 0 ] && printf '%s\n' "$line" | grep -Eq '^(@include[[:space:]]+(common-auth|system-auth)|auth[[:space:]]+include[[:space:]]+(common-auth|system-auth))'; then
+            printf '%s\n%s\n%s\n' "$PAM_BLOCK_START" "$PAM_LINE" "$PAM_BLOCK_END" >>"$tmp"
+            inserted=1
+        fi
+        printf '%s\n' "$line" >>"$tmp"
+    done <"$file"
+
+    if [ "$inserted" -eq 0 ]; then
+        printf '\n%s\n%s\n%s\n' "$PAM_BLOCK_START" "$PAM_LINE" "$PAM_BLOCK_END" >>"$tmp"
+    fi
+
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+}
+
+configure_pam_value="${FACE_AUTHD_CONFIGURE_PAM:-}"
+if [ -z "$configure_pam_value" ] && [ -f /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+    db_get face-authd/configure_pam || true
+    configure_pam_value="$RET"
+    db_stop || true
+fi
+
+case "$configure_pam_value" in
+    true|yes|1)
+        add_pam_block /etc/pam.d/sudo
+        add_pam_block /etc/pam.d/gdm-password
+        ;;
+esac
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    if [ -d /run/systemd/system ]; then
+        systemctl enable --now face-authd.service || true
+    fi
+fi
+
+exit 0

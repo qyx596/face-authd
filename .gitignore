@@ -1,0 +1,8 @@
+/target
+/dist
+/.idea
+/.vscode
+/.codex
+/.claude/
+/frame.pgm
+Cargo.lock

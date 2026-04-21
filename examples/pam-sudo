@@ -1,0 +1,10 @@
+# /etc/pam.d/sudo 示例
+#
+# 建议先将人脸认证设置为 sufficient 或者 optional，
+# 确认稳定后再决定是否改成 required。
+
+auth sufficient pam_face_auth.so
+auth include system-auth
+
+account include system-auth
+session include system-auth
