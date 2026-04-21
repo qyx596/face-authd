@@ -4,5 +4,6 @@
 /.vscode
 /.codex
 /.claude/
+/.cargo/
 /frame.pgm
 Cargo.lock

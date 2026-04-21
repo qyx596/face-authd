@@ -1,3 +1,0 @@
-[env]
-LIBCLANG_PATH = "/usr/lib/llvm-20/lib"
-BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/include"
