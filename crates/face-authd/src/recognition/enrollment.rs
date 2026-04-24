@@ -27,6 +27,7 @@ struct EncryptedEnrollment {
 const ENCRYPTED_FORMAT_V1: &str = "face-authd-enrollment-v1";
 const KEYRING_KEY_DESC: &str = "face-authd:enrollment-key:v1";
 const NONCE_SIZE: usize = 12;
+const KEY_FILE_NAME: &str = "enrollment.key";
 
 impl UserEnrollment {
     pub fn embeddings_as_arrays(&self) -> Vec<Embedding> {
@@ -157,17 +158,16 @@ pub fn check_enrollment_dir(path: &Path) -> Result<()> {
 }
 
 fn read_or_create_key() -> Result<[u8; 32]> {
-    let mut session = Keyring::attach_or_create(SpecialKeyring::Session)
-        .context("failed to attach session keyring for enrollment key")?;
-    let mut keyring = session
-        .attach_persistent()
-        .context("failed to attach persistent keyring for enrollment key")?;
+    let key_path = enrollment_key_path();
+    if key_path.exists() {
+        let payload = fs::read(&key_path)
+            .with_context(|| format!("failed to read enrollment key from {}", key_path.display()))?;
+        return as_fixed_key(&payload, &format!("key file {}", key_path.display()));
+    }
 
-    if let Ok(key) = keyring.search_for_key::<keytypes::User, _, _>(KEYRING_KEY_DESC, None) {
-        let payload = key
-            .read()
-            .context("failed to read enrollment key from keyring")?;
-        return as_fixed_key(&payload);
+    if let Some(key) = try_read_legacy_keyring_key()? {
+        persist_key_to_file(&key_path, &key)?;
+        return Ok(key);
     }
 
     let mut key = [0u8; 32];
@@ -177,19 +177,59 @@ fn read_or_create_key() -> Result<[u8; 32]> {
     urandom
         .read_exact(&mut key)
         .context("failed to read random bytes for enrollment key")?;
-
-    keyring
-        .add_key::<keytypes::User, _, _>(KEYRING_KEY_DESC, key.as_slice())
-        .context("failed to store enrollment key in keyring")?;
+    persist_key_to_file(&key_path, &key)?;
     Ok(key)
 }
 
-fn as_fixed_key(decoded: &[u8]) -> Result<[u8; 32]> {
+fn enrollment_key_path() -> PathBuf {
+    enrollment_dir().join(KEY_FILE_NAME)
+}
+
+fn try_read_legacy_keyring_key() -> Result<Option<[u8; 32]>> {
+    let Ok(mut session) = Keyring::attach_or_create(SpecialKeyring::Session) else {
+        return Ok(None);
+    };
+    let Ok(keyring) = session.attach_persistent() else {
+        return Ok(None);
+    };
+
+    let Ok(key) = keyring.search_for_key::<keytypes::User, _, _>(KEYRING_KEY_DESC, None) else {
+        return Ok(None);
+    };
+
+    let payload = key
+        .read()
+        .context("failed to read enrollment key from legacy keyring")?;
+    let key = as_fixed_key(&payload, "legacy keyring")?;
+    Ok(Some(key))
+}
+
+fn persist_key_to_file(path: &Path, key: &[u8; 32]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create key directory {}", parent.display()))?;
+    }
+
+    let tmp = path.with_extension("key.tmp");
+    fs::write(&tmp, key)
+        .with_context(|| format!("failed to write enrollment key to {}", tmp.display()))?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename enrollment key to {}", path.display()))?;
+    Ok(())
+}
+
+fn as_fixed_key(decoded: &[u8], source: &str) -> Result<[u8; 32]> {
     if decoded.len() != 32 {
-        anyhow::bail!("invalid enrollment key size in keyring: expected 32 bytes, got {}", decoded.len());
+        anyhow::bail!(
+            "invalid enrollment key size in {}: expected 32 bytes, got {}",
+            source,
+            decoded.len()
+        );
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&decoded);
+    out.copy_from_slice(decoded);
     Ok(out)
 }
 

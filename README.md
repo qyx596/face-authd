@@ -63,9 +63,35 @@ Optional:
 sudo face-authd setup --user "$USER" --device /dev/video2
 ```
 
+## Build Requirements
+
+This project links against system libraries for:
+
+- dlib
+- PAM
+- BLAS / LAPACK
+- SQLite
+
+On Debian/Ubuntu, install the build dependencies with:
+
+```bash
+sudo apt-get install -y \
+  build-essential \
+  pkg-config \
+  cmake \
+  clang \
+  libdlib-dev \
+  libpam0g-dev \
+  libblas-dev \
+  liblapack-dev \
+  libsqlite3-dev
+```
+
+You also need a working Rust toolchain with `cargo` and `rustc`.
+
 ## Manual Install (Any Linux Distro)
 
-If you are not using Debian-based systems, install manually:
+If you are not using Debian packages, build from source:
 
 ```bash
 cargo build --release -p pam-face-auth -p face-authd
@@ -95,6 +121,34 @@ sudo install -Dm755 target/release/libpam_face_auth.so /usr/lib64/security/pam_f
 
 Then add `pam_face_auth.so` to your PAM stack (`/etc/pam.d/sudo` first, then login stack if needed).
 
+## Packaging
+
+Build a Debian package:
+
+```bash
+bash scripts/build-deb.sh
+```
+
+This produces:
+
+- `dist/face-authd_<version>_amd64.deb`
+
+Notes:
+
+- The Debian packaging script downloads the dlib model files during the build.
+- `dpkg-deb` must be available on the build machine.
+
+Build an RPM package:
+
+```bash
+bash scripts/build-rpm.sh
+```
+
+Notes:
+
+- The RPM packaging script also downloads the dlib model files during the build.
+- `fpm` must be installed first, as required by the script.
+
 ## Most Useful Commands
 
 ```bash
@@ -116,7 +170,7 @@ face-authd enrolled
 - Data: `/var/lib/face-authd`
 - Models: `/var/lib/face-authd/models`
 
-Enrollment templates are encrypted at rest (AES-256-GCM). Encryption keys are stored in Linux keyring.
+Enrollment templates are encrypted at rest (AES-256-GCM). Encryption keys are stored in `/var/lib/face-authd/enrollment.key` with `0600` permissions so the daemon can read them reliably after boot.
 
 ## Notes
 

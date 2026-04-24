@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 PKG_NAME="face-authd"
-PKG_VERSION="${PKG_VERSION:-0.1.0}"
+PKG_VERSION="${PKG_VERSION:-0.1.2}"
 ARCH="${ARCH:-$(dpkg --print-architecture)}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist}"
 BUILD_DIR="$ROOT_DIR/target/deb-build/${PKG_NAME}_${PKG_VERSION}_${ARCH}"

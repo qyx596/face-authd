@@ -10,7 +10,7 @@ if ! command -v fpm >/dev/null 2>&1; then
 fi
 
 PKG_NAME="face-authd"
-PKG_VERSION="${PKG_VERSION:-0.1.0}"
+PKG_VERSION="${PKG_VERSION:-0.1.2}"
 RPM_ARCH="${RPM_ARCH:-$(uname -m)}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist}"
 STAGE_ROOT="$ROOT_DIR/target/rpm-build/root"
