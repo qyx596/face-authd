@@ -1157,7 +1157,7 @@ fn run_enroll(args: &[String]) -> anyhow::Result<()> {
     check_enrollment_dir(&enroll_dir)
         .with_context(|| format!("enrollment directory {} is not usable", enroll_dir.display()))?;
 
-    if load_enrollment(&username)?.is_some() && !replace_existing {
+    if !replace_existing && load_enrollment(&username)?.is_some() {
         anyhow::bail!(
             "enrollment for '{}' already exists; use --replace to overwrite or run `face-authd unenroll --user {}` first",
             username,
