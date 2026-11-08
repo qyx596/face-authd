@@ -30,31 +30,33 @@ impl EmitterController for EmitterMode {
 
 impl EmitterController for ExternalEmitterCommand {
     fn activate(&self, _device: Option<&Path>) -> Result<()> {
-        let output = Command::new(&self.program)
+        // Bound external hardware helpers; never block a Tokio runtime thread.
+        let mut child = Command::new(&self.program)
             .args(&self.args)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .with_context(|| {
                 format!("failed to run emitter command '{}'", self.program.display())
             })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            anyhow::bail!(
-                "emitter command '{}' failed (exit={} stdout='{}' stderr='{}')",
-                self.program.display(),
-                output.status,
-                stdout,
-                stderr
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            Ok(())
-        } else {
-            eprintln!("emitter: ran '{}': {}", self.program.display(), stdout);
-            Ok(())
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    anyhow::ensure!(status.success(), "emitter command failed: {status}");
+                    return Ok(());
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    result.context("failed to wait for emitter command")?;
+                    anyhow::bail!("emitter command timed out");
+                }
+            }
         }
     }
 }

@@ -1,145 +1,125 @@
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct ModelSpec {
-    /// Final (decompressed) filename stored on disk.
     pub filename: &'static str,
-    /// Download URL; if it ends with `.bz2` the file is decompressed after download.
     pub url: &'static str,
-    /// Hex-encoded SHA-256 of the *decompressed* file; empty = skip verification.
     pub sha256: &'static str,
 }
-
-/// dlib 5-point face landmark predictor.
-pub const SP5_MODEL: ModelSpec = ModelSpec {
-    filename: "shape_predictor_5_face_landmarks.dat",
-    url: "https://github.com/davisking/dlib-models/raw/master/shape_predictor_5_face_landmarks.dat.bz2",
-    sha256: "",
+// OpenCV Zoo revision pinned; hashes equal upstream Git LFS object IDs.
+pub const DET_MODEL: ModelSpec = ModelSpec {
+    filename: "face_detection_yunet_2023mar.onnx",
+    url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+    sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
 };
-
-/// dlib ResNet face recognition model (128-dim descriptor).
 pub const REC_MODEL: ModelSpec = ModelSpec {
-    filename: "dlib_face_recognition_resnet_model_v1.dat",
-    url: "http://dlib.net/files/dlib_face_recognition_resnet_model_v1.dat.bz2",
-    sha256: "",
+    filename: "face_recognition_sface_2021dec.onnx",
+    url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+    sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
 };
-
+const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024;
 pub fn model_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("FACE_AUTHD_MODEL_DIR") {
-        return PathBuf::from(dir);
-    }
-
-    PathBuf::from("/var/lib/face-authd/models")
+    std::env::var_os("FACE_AUTHD_MODEL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/face-authd/models"))
 }
-
-/// Return the path to a model, downloading and decompressing it if necessary.
+fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    anyhow::ensure!(expected.len() == 64, "model checksum must be pinned");
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let m = file.metadata()?;
+    anyhow::ensure!(
+        m.is_file()
+            && m.mode() & 0o022 == 0
+            && (m.uid() == 0 || m.uid() == unsafe { libc::geteuid() }),
+        "untrusted model file {}",
+        path.display()
+    );
+    anyhow::ensure!(m.len() <= MAX_MODEL_BYTES, "model exceeds size limit");
+    let mut sha = Sha256::new();
+    std::io::copy(&mut file, &mut sha)?;
+    anyhow::ensure!(
+        format!("{:x}", sha.finalize()) == expected,
+        "model checksum mismatch: {}",
+        path.display()
+    );
+    Ok(())
+}
+/// Authentication never downloads models or accepts unverified cached weights.
 pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf> {
-    let dir = model_dir();
-    let path = dir.join(spec.filename);
-
-    if path.exists() {
-        if !spec.sha256.is_empty() {
-            verify_sha256(&path, spec.sha256).with_context(|| {
-                format!(
-                    "model {} failed checksum; delete it to re-download",
-                    path.display()
-                )
-            })?;
-        }
-        return Ok(path);
-    }
-
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create model directory {}", dir.display()))?;
-
-    eprintln!("Downloading {} → {}", spec.filename, path.display());
-    let compressed = download_to_memory(spec.url)
-        .with_context(|| format!("failed to download {}", spec.url))?;
-
-    let data = if spec.url.ends_with(".bz2") {
-        decompress_bz2(&compressed)
-            .with_context(|| format!("failed to decompress {}", spec.url))?
-    } else {
-        compressed
-    };
-
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &data)
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-
-    if !spec.sha256.is_empty() {
-        verify_sha256_bytes(&data, spec.sha256)
-            .map_err(|err| {
-                let _ = fs::remove_file(&tmp);
-                err
-            })
-            .with_context(|| format!("downloaded {} failed checksum; removed", spec.filename))?;
-    }
-
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("failed to rename {} → {}", tmp.display(), path.display()))?;
-
-    eprintln!("Saved {} ({:.1} MB)", spec.filename, data.len() as f64 / 1_048_576.0);
+    let path = model_dir().join(spec.filename);
+    verify_sha256(&path, spec.sha256).with_context(|| {
+        format!(
+            "model {} is missing or invalid; run `face-authd fetch-models` explicitly",
+            path.display()
+        )
+    })?;
     Ok(path)
 }
-
-fn download_to_memory(url: &str) -> Result<Vec<u8>> {
-    let mut response = reqwest::blocking::get(url)
-        .with_context(|| format!("HTTP GET failed for {url}"))?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("HTTP {} for {url}", response.status());
-    }
-
-    let total = response.content_length();
-    let mut data = Vec::with_capacity(total.unwrap_or(0) as usize);
-    let mut buf = vec![0u8; 65536];
-
-    loop {
-        let n = std::io::Read::read(&mut response, &mut buf)
-            .context("read error during download")?;
-        if n == 0 {
-            break;
+pub fn fetch_models() -> Result<()> {
+    let dir = model_dir();
+    fs::create_dir_all(&dir)?;
+    let meta = fs::symlink_metadata(&dir)?;
+    anyhow::ensure!(
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.mode() & 0o022 == 0
+            && meta.uid() == unsafe { libc::geteuid() },
+        "untrusted model directory"
+    );
+    let client = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(90))
+        .build()?;
+    for spec in [&DET_MODEL, &REC_MODEL] {
+        let path = dir.join(spec.filename);
+        if verify_sha256(&path, spec.sha256).is_ok() {
+            continue;
         }
-        data.extend_from_slice(&buf[..n]);
-        match total {
-            Some(t) => eprint!("\r  {:.1} / {:.1} MB", mb(data.len() as u64), mb(t)),
-            None    => eprint!("\r  {:.1} MB", mb(data.len() as u64)),
-        }
-    }
-    let _ = std::io::stderr().flush();
-    eprintln!();
-    Ok(data)
-}
-
-fn decompress_bz2(data: &[u8]) -> Result<Vec<u8>> {
-    use bzip2::read::BzDecoder;
-    use std::io::Read;
-
-    let mut decoder = BzDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).context("bz2 decompression failed")?;
-    Ok(out)
-}
-
-fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let data = fs::read(path)
-        .with_context(|| format!("cannot read {} for checksum", path.display()))?;
-    verify_sha256_bytes(&data, expected)
-}
-
-fn verify_sha256_bytes(data: &[u8], expected: &str) -> Result<()> {
-    let actual = format!("{:x}", Sha256::digest(data));
-    if actual != expected {
-        anyhow::bail!("checksum mismatch: expected {} got {}", expected, actual);
+        let response = client.get(spec.url).send()?.error_for_status()?;
+        let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+        let bytes = std::io::copy(&mut response.take(MAX_MODEL_BYTES + 1), &mut temp)?;
+        anyhow::ensure!(bytes <= MAX_MODEL_BYTES, "model download exceeds limit");
+        temp.flush()?;
+        temp.as_file().sync_all()?;
+        verify_sha256(temp.path(), spec.sha256)?;
+        temp.persist(&path).map_err(|e| e.error)?;
+        File::open(&dir)?.sync_all()?;
+        eprintln!("Verified {}", spec.filename);
     }
     Ok(())
 }
-
-fn mb(bytes: u64) -> f64 {
-    bytes as f64 / 1_048_576.0
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn packaging_uses_the_same_pinned_models() {
+        let script = include_str!("../../../../scripts/download-models.sh");
+        for model in [&DET_MODEL, &REC_MODEL] {
+            assert!(script.contains(model.filename));
+            assert!(script.contains(model.sha256));
+            let revision = model.url.split('/').nth(6).unwrap();
+            assert!(script.contains(revision));
+        }
+    }
+    #[test]
+    fn reject_corrupt_and_symlinked_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("model");
+        fs::write(&file, b"weights").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"weights"));
+        assert!(verify_sha256(&file, &hash).is_ok());
+        assert!(verify_sha256(&file, &"0".repeat(64)).is_err());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(verify_sha256(&link, &hash).is_err());
+    }
 }

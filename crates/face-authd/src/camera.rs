@@ -45,6 +45,15 @@ impl Default for CaptureConfig {
     }
 }
 
+/// Keep enrollment, verification, and daemon capture resolution consistent.
+pub fn auth_capture_config() -> CaptureConfig {
+    CaptureConfig {
+        width: Some(640),
+        height: Some(360),
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
     pub device: PathBuf,
@@ -66,6 +75,21 @@ pub struct GrayscaleFrame {
 pub enum StreamControl {
     Continue,
     Stop,
+}
+
+impl GrayscaleFrame {
+    pub fn validate(&self) -> Result<()> {
+        let length = (self.width as usize).checked_mul(self.height as usize);
+        anyhow::ensure!(
+            self.width > 0
+                && self.height > 0
+                && self.width <= i32::MAX as u32
+                && self.height <= i32::MAX as u32
+                && length == Some(self.pixels.len()),
+            "invalid grayscale frame dimensions or buffer length"
+        );
+        Ok(())
+    }
 }
 
 pub fn discover_video_devices() -> Result<Vec<VideoDeviceInfo>> {
@@ -145,6 +169,44 @@ pub fn select_capture_device(
         .or_else(|| devices.first().cloned())
 }
 
+/// An explicit stable path wins. Never silently switch cameras if it disappears.
+pub fn select_auth_device(devices: &[VideoDeviceInfo]) -> Result<VideoDeviceInfo> {
+    select_auth_device_with_preference(devices, preferred_device_from_env().as_deref())
+}
+
+fn select_auth_device_with_preference(
+    devices: &[VideoDeviceInfo],
+    preferred: Option<&Path>,
+) -> Result<VideoDeviceInfo> {
+    if let Some(preferred) = preferred {
+        let preferred = preferred.to_path_buf();
+        let canonical = fs::canonicalize(&preferred).unwrap_or(preferred.clone());
+        return devices
+            .iter()
+            .find(|d| {
+                d.supports_capture
+                    && d.supports_streaming
+                    && (d.path == canonical
+                        || d.path == preferred
+                        || d.symlinks.contains(&preferred))
+            })
+            .cloned()
+            .with_context(|| format!("configured camera {} is unavailable", preferred.display()));
+    }
+    devices
+        .iter()
+        .find(|d| {
+            d.supports_capture && d.supports_streaming && matches!(d.fourcc.as_str(), "GREY" | "Y8")
+        })
+        .cloned()
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|d| d.supports_capture && d.supports_streaming)
+                .cloned()
+        })
+        .context("no capture camera found")
+}
 
 pub fn capture_single_frame(device_path: &Path, config: &CaptureConfig) -> Result<CapturedFrame> {
     capture_frames(device_path, config, 1)?
@@ -182,6 +244,7 @@ pub fn capture_frames(
     let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, config.buffers)
         .with_context(|| format!("failed to create mmap stream for {}", device_path.display()))?;
 
+    stream.set_timeout(std::time::Duration::from_secs(2));
     let mut frames = Vec::with_capacity(count);
     for _ in 0..count {
         let (buf, meta) = stream
@@ -234,6 +297,7 @@ where
     let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, config.buffers)
         .with_context(|| format!("failed to create mmap stream for {}", device_path.display()))?;
 
+    stream.set_timeout(std::time::Duration::from_millis(500));
     for _ in 0..warmup_frames {
         let _ = stream
             .next()
@@ -386,11 +450,15 @@ fn decode_mjpg(frame: &CapturedFrame) -> Result<GrayscaleFrame> {
     let grayscale = match info.pixel_format {
         JpegPixelFormat::L8 => pixels,
         JpegPixelFormat::RGB24 => pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|chunk| rgb_to_luma(chunk[0], chunk[1], chunk[2]))
             .collect(),
         JpegPixelFormat::CMYK32 => pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| {
                 let c = chunk[0] as f32 / 255.0;
                 let m = chunk[1] as f32 / 255.0;
@@ -423,7 +491,7 @@ fn decode_yuyv(frame: &CapturedFrame) -> Result<GrayscaleFrame> {
     }
 
     let mut pixels = Vec::with_capacity(frame.width as usize * frame.height as usize);
-    for chunk in frame.bytes[..expected].chunks_exact(4) {
+    for chunk in frame.bytes[..expected].as_chunks::<4>().0.iter() {
         pixels.push(chunk[0]);
         pixels.push(chunk[2]);
     }
@@ -440,4 +508,194 @@ fn rgb_to_luma(r: u8, g: u8, b: u8) -> u8 {
     let g = g as u32;
     let b = b as u32;
     ((299 * r + 587 * g + 114 * b) / 1000) as u8
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    fn device(path: &str, fourcc: &str) -> VideoDeviceInfo {
+        VideoDeviceInfo {
+            path: path.into(),
+            symlinks: vec![],
+            driver: String::new(),
+            card: String::new(),
+            bus: String::new(),
+            supports_capture: true,
+            supports_streaming: true,
+            width: 640,
+            height: 360,
+            fourcc: fourcc.into(),
+        }
+    }
+    #[test]
+    fn preference_wins_over_gray_and_missing_device_fails() {
+        let devices = vec![
+            device("/dev/mock-rgb", "MJPG"),
+            device("/dev/mock-ir", "GREY"),
+        ];
+        assert_eq!(
+            select_auth_device_with_preference(&devices, None)
+                .unwrap()
+                .path,
+            Path::new("/dev/mock-ir")
+        );
+        assert_eq!(
+            select_auth_device_with_preference(&devices, Some(Path::new("/dev/mock-rgb")))
+                .unwrap()
+                .path,
+            Path::new("/dev/mock-rgb")
+        );
+        assert!(
+            select_auth_device_with_preference(&devices, Some(Path::new("/dev/missing"))).is_err()
+        );
+    }
+    #[test]
+    fn metadata_nodes_and_invalid_frame_buffers_are_rejected() {
+        let mut metadata = device("/dev/metadata", "GREY");
+        metadata.supports_capture = false;
+        assert!(select_auth_device_with_preference(&[metadata], None).is_err());
+        for frame in [
+            GrayscaleFrame {
+                width: 0,
+                height: 1,
+                pixels: vec![],
+            },
+            GrayscaleFrame {
+                width: 100,
+                height: 100,
+                pixels: vec![0; 10],
+            },
+        ] {
+            assert!(frame.validate().is_err());
+        }
+    }
+}
+
+/// Recognition keeps RGB camera color; IR gray pixels are repeated into B,G,R.
+#[derive(Debug, Clone)]
+pub struct BgrFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+impl BgrFrame {
+    pub fn validate(&self) -> Result<()> {
+        let length = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(3));
+        anyhow::ensure!(
+            self.width > 0
+                && self.height > 0
+                && self.width <= 8192
+                && self.height <= 8192
+                && length == Some(self.pixels.len()),
+            "invalid BGR frame dimensions or buffer length"
+        );
+        Ok(())
+    }
+}
+pub fn decode_to_bgr(frame: &CapturedFrame) -> Result<BgrFrame> {
+    anyhow::ensure!(
+        frame.width > 0 && frame.height > 0 && frame.width <= 8192 && frame.height <= 8192,
+        "invalid capture dimensions"
+    );
+    let count = frame.width as usize * frame.height as usize;
+    let pixels = match normalized_fourcc(&frame.fourcc).as_str() {
+        "GREY" | "Y8" => {
+            let gray = decode_grey(frame)?;
+            gray.pixels.iter().flat_map(|v| [*v; 3]).collect()
+        }
+        "MJPG" | "JPEG" => {
+            let mut decoder = JpegDecoder::new(std::io::Cursor::new(&frame.bytes));
+            let pixels = decoder.decode().context("invalid JPEG capture")?;
+            let info = decoder.info().context("missing JPEG metadata")?;
+            anyhow::ensure!(
+                u32::from(info.width) == frame.width && u32::from(info.height) == frame.height,
+                "JPEG dimensions differ from negotiated capture format"
+            );
+            match info.pixel_format {
+                JpegPixelFormat::RGB24 => pixels
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[2], p[1], p[0]])
+                    .collect(),
+                JpegPixelFormat::L8 => pixels.iter().flat_map(|v| [*v; 3]).collect(),
+                _ => anyhow::bail!("unsupported recognition JPEG pixel format"),
+            }
+        }
+        "YUYV" | "YUY2" => {
+            anyhow::ensure!(
+                frame.width.is_multiple_of(2) && frame.bytes.len() >= count * 2,
+                "invalid YUYV frame"
+            );
+            frame.bytes[..count * 2]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| {
+                    let yuv = |y: u8| {
+                        let c = i32::from(y) - 16;
+                        let d = i32::from(p[1]) - 128;
+                        let e = i32::from(p[3]) - 128;
+                        let byte = |v: i32| ((v + 128) >> 8).clamp(0, 255) as u8;
+                        [
+                            byte(298 * c + 516 * d),
+                            byte(298 * c - 100 * d - 208 * e),
+                            byte(298 * c + 409 * e),
+                        ]
+                    };
+                    let a = yuv(p[0]);
+                    let b = yuv(p[2]);
+                    [a[0], a[1], a[2], b[0], b[1], b[2]]
+                })
+                .collect()
+        }
+        other => anyhow::bail!("unsupported recognition capture format: {other}"),
+    };
+    let bgr = BgrFrame {
+        width: frame.width,
+        height: frame.height,
+        pixels,
+    };
+    bgr.validate()?;
+    Ok(bgr)
+}
+
+#[cfg(test)]
+mod bgr_tests {
+    use super::*;
+    fn capture(fourcc: &str, bytes: Vec<u8>) -> CapturedFrame {
+        CapturedFrame {
+            device: "/dev/test".into(),
+            width: 2,
+            height: 1,
+            fourcc: fourcc.into(),
+            sequence: 1,
+            bytes,
+        }
+    }
+    #[test]
+    fn gray_and_yuyv_preprocessing() {
+        let gray = decode_to_bgr(&capture("GREY", vec![20, 40])).unwrap();
+        assert_eq!(gray.pixels, [20, 20, 20, 40, 40, 40]);
+        let yuyv = decode_to_bgr(&capture("YUYV", vec![16, 128, 235, 128])).unwrap();
+        assert_eq!(yuyv.pixels, [0, 0, 0, 255, 255, 255]);
+        assert!(decode_to_bgr(&capture("YUYV", vec![0])).is_err());
+        assert!(decode_to_bgr(&capture("GREY", vec![0])).is_err());
+    }
+    #[test]
+    fn rgb_color_is_preserved_as_bgr() {
+        let mut data = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, 100)
+            .encode(
+                &[255, 0, 0, 255, 0, 0],
+                2,
+                1,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        let bgr = decode_to_bgr(&capture("MJPG", data)).unwrap();
+        assert!(bgr.pixels[2] > 240 && bgr.pixels[0] < 15 && bgr.pixels[1] < 15);
+    }
 }

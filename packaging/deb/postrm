@@ -21,8 +21,10 @@ if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     # Remove managed PAM entries to avoid stale pam_face_auth.so references after uninstall.
     remove_pam_block /etc/pam.d/sudo
     remove_pam_block /etc/pam.d/gdm-password
+fi
 
-    # User requested cleanup: remove all persisted face-authd data (embeddings/models).
+if [ "$1" = "purge" ]; then
+    # Keep biometric enrollment and keys on ordinary removal.
     if [ -d /var/lib/face-authd ]; then
         rm -rf /var/lib/face-authd
     fi

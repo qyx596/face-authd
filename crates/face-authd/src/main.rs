@@ -1,3 +1,4 @@
+mod benchmark;
 mod camera;
 mod emitter;
 mod provider;
@@ -5,8 +6,8 @@ mod raw_controls;
 mod recognition;
 mod vision;
 
-use std::env;
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,15 +16,16 @@ use std::sync::Arc;
 use anyhow::Context;
 use camera::{
     capture_frames, capture_single_frame, decode_to_grayscale, discover_video_devices,
-    preferred_device_from_env, select_capture_device, write_frame_to_path,
-    stream_frames, write_grayscale_pgm, CaptureConfig, StreamControl,
+    preferred_device_from_env, select_capture_device, stream_frames, write_frame_to_path,
+    write_grayscale_pgm, CaptureConfig, StreamControl,
 };
 use common::protocol::{
     encode_response, AuthenticateRequest, AuthenticateResponse, ErrorResponse, Request, Response,
-    DEFAULT_SOCKET_PATH, PROTOCOL_VERSION,
+    DEFAULT_SOCKET_PATH, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use eframe::egui;
-use provider::{AuthDecision, FaceAuthProvider, FaceProvider, StubProvider};
+use emitter::EmitterController;
+use provider::{AuthDecision, FaceAuthProvider, FaceProvider};
 use raw_controls::{query_device_controls, set_device_control};
 use recognition::{
     detector::{Detection, FaceDetector},
@@ -33,7 +35,10 @@ use recognition::{
     },
     FaceRecognizer, DEFAULT_THRESHOLD,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 use vision::{format_analysis, FrameAnalyzer, StubFrameAnalyzer};
@@ -47,6 +52,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = env::args().collect();
+    if matches!(args.get(1).map(String::as_str), Some("benchmark")) {
+        return benchmark::run(&args[2..]);
+    }
+    if matches!(args.get(1).map(String::as_str), Some("fetch-models")) {
+        return tokio::task::spawn_blocking(recognition::models::fetch_models).await?;
+    }
     if matches!(args.get(1).map(String::as_str), Some("probe-cameras")) {
         return run_probe_cameras(&args[2..]);
     }
@@ -59,7 +70,10 @@ async fn main() -> anyhow::Result<()> {
     if matches!(args.get(1).map(String::as_str), Some("setup")) {
         return run_setup(&args[2..]);
     }
-    if matches!(args.get(1).map(String::as_str), Some("enroll-verify" | "onboard")) {
+    if matches!(
+        args.get(1).map(String::as_str),
+        Some("enroll-verify" | "onboard")
+    ) {
         return run_enroll_verify(&args[2..]);
     }
     if matches!(args.get(1).map(String::as_str), Some("enrolled")) {
@@ -90,32 +104,74 @@ async fn run_daemon() -> anyhow::Result<()> {
     let socket_path =
         std::env::var("FACE_AUTHD_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string());
 
-    if Path::new(&socket_path).exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale socket at {socket_path}"))?;
+    anyhow::ensure!(unsafe { libc::geteuid() } == 0, "daemon must run as root");
+    unsafe {
+        libc::umask(0o077);
     }
-
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind unix socket at {socket_path}"))?;
-
+    let socket_parent = Path::new(&socket_path)
+        .parent()
+        .context("socket path has no parent")?;
+    let parent_meta = fs::symlink_metadata(socket_parent)?;
+    anyhow::ensure!(
+        Path::new(&socket_path).is_absolute()
+            && parent_meta.is_dir()
+            && !parent_meta.file_type().is_symlink()
+            && parent_meta.uid() == 0
+            && parent_meta.mode() & 0o022 == 0,
+        "socket must be in an absolute, root-owned directory without group/other write access"
+    );
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(format!("{socket_path}.lock"))?;
+    let lock_meta = lock.metadata()?;
+    anyhow::ensure!(
+        lock_meta.is_file() && lock_meta.uid() == 0 && lock_meta.mode() & 0o077 == 0,
+        "unsafe socket lock owner or permissions"
+    );
+    anyhow::ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "another daemon holds the socket lock"
+    );
+    if let Ok(meta) = fs::symlink_metadata(&socket_path) {
+        anyhow::ensure!(
+            meta.file_type().is_socket() && meta.uid() == 0,
+            "refusing to remove non-root socket or non-socket path"
+        );
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(_) => anyhow::bail!("socket already has a listener"),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                fs::remove_file(&socket_path)?
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    // Model failures are fatal. Production must never fall back to a test provider.
+    let threshold = std::env::var("FACE_AUTHD_THRESHOLD")
+        .unwrap_or_else(|_| DEFAULT_THRESHOLD.to_string())
+        .parse::<f32>()
+        .context("FACE_AUTHD_THRESHOLD must be a distance")?;
+    recognition::validate_threshold(threshold)?;
+    let recognizer = load_face_recognizer_blocking()?;
+    let provider: Arc<dyn FaceAuthProvider> = Arc::new(FaceProvider::new(recognizer, threshold));
+    let listener = UnixListener::bind(&socket_path)?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     info!("face-authd listening on {}", socket_path);
-
-    let provider: Arc<dyn FaceAuthProvider> = match load_face_recognizer_blocking() {
-        Ok(recognizer) => {
-            info!("face recognition models loaded");
-            Arc::new(FaceProvider::new(recognizer, DEFAULT_THRESHOLD))
-        }
-        Err(err) => {
-            warn!(error = %err, "failed to load recognition models; falling back to stub provider");
-            Arc::new(StubProvider::default())
-        }
-    };
-
+    let connections = Arc::new(tokio::sync::Semaphore::new(32));
     loop {
         let (stream, _) = listener.accept().await?;
+        if stream.peer_cred()?.uid() != 0 {
+            continue;
+        }
+        let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+            continue;
+        };
         let provider = Arc::clone(&provider);
-
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle_client(stream, provider).await {
                 error!(error = %err, "client handling failed");
             }
@@ -419,53 +475,62 @@ fn run_verify(args: &[String]) -> anyhow::Result<()> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--user" => username = iter.next().context("--user requires a value")?.clone(),
-            "--device" => device = Some(PathBuf::from(iter.next().context("--device requires a path")?)),
+            "--device" => {
+                device = Some(PathBuf::from(
+                    iter.next().context("--device requires a path")?,
+                ))
+            }
             "--frames" => {
-                frames = iter.next().context("--frames requires a value")?
-                    .parse().context("--frames must be a positive integer")?;
+                frames = iter
+                    .next()
+                    .context("--frames requires a value")?
+                    .parse()
+                    .context("--frames must be a positive integer")?;
             }
             "--threshold" => {
-                threshold = iter.next().context("--threshold requires a value")?
-                    .parse().context("--threshold must be a float")?;
+                threshold = iter
+                    .next()
+                    .context("--threshold requires a value")?
+                    .parse()
+                    .context("--threshold must be a float")?;
             }
             other => anyhow::bail!("unknown verify argument: {other}"),
         }
     }
 
+    recognition::validate_threshold(threshold)?;
+    anyhow::ensure!(frames > 0 && frames <= 100, "--frames must be in 1..=100");
     let enrollment = recognition::enrollment::load_enrollment(&username)?
         .with_context(|| format!("no enrollment found for '{username}'; run enroll first"))?;
     let enrolled = enrollment.embeddings_as_arrays();
     if enrolled.is_empty() {
         anyhow::bail!("enrollment for '{username}' has no valid 128-dim embeddings");
     }
-    println!("Loaded {} enrolled embedding(s) for '{username}'", enrolled.len());
+    println!(
+        "Loaded {} enrolled embedding(s) for '{username}'",
+        enrolled.len()
+    );
     println!("Threshold: {threshold:.4}");
 
     let devices = discover_video_devices()?;
     let ir_device = match device {
         Some(p) => p,
-        None => {
-            let preferred = preferred_device_from_env();
-            let fallback = select_capture_device(&devices, preferred.as_deref());
-            devices.iter()
-                .find(|d| d.supports_capture && d.supports_streaming
-                    && matches!(d.fourcc.as_str(), "GREY" | "Y8"))
-                .or_else(|| fallback.as_ref())
-                .map(|d| d.path.clone())
-                .context("no suitable camera found; use --device")?
-        }
+        None => camera::select_auth_device(&devices)?.path,
     };
     println!("Camera: {}", ir_device.display());
 
     println!("Loading models...");
     let mut recognizer = load_face_recognizer_blocking()?;
+    emitter::emitter_from_env().activate(Some(&ir_device))?;
     println!("Ready — hold face in front of camera.\n");
-    println!("{:<8} {:<12} {}", "Frame", "Score", "Result");
+    println!("{:<8} {:<12} Result", "Frame", "Distance");
     println!("{}", "-".repeat(32));
 
-    let cap_config = CaptureConfig::default();
+    let cap_config = camera::auth_capture_config();
     let mut frame_n = 0usize;
-    let mut best: f32 = f32::NEG_INFINITY;
+    let mut best: f32 = f32::INFINITY;
+    let mut tracker = recognition::MatchTracker::new(threshold)?;
+    let mut confirmed = false;
 
     stream_frames(&ir_device, &cap_config, 2, |frame| {
         if frame_n >= frames {
@@ -473,13 +538,23 @@ fn run_verify(args: &[String]) -> anyhow::Result<()> {
         }
         frame_n += 1;
 
-        let gray = decode_to_grayscale(&frame)?;
+        let gray = camera::decode_to_bgr(&frame)?;
         match recognizer.extract(&gray)? {
-            None => println!("{:<8} {:<12} no face", frame_n, "-"),
+            None => {
+                tracker.observe(f32::INFINITY);
+                println!("{:<8} {:<12} no single face", frame_n, "-");
+            }
             Some(emb) => {
-                let score = FaceRecognizer::match_score(&emb, &enrolled);
-                if score > best { best = score; }
-                let verdict = if score >= threshold { "MATCH ✓" } else { "no match" };
+                let score = FaceRecognizer::match_distance(&emb, &enrolled);
+                if score < best {
+                    best = score;
+                }
+                confirmed |= tracker.observe(score);
+                let verdict = if score < threshold {
+                    "MATCH ✓"
+                } else {
+                    "no match"
+                };
                 println!("{:<8} {:<12.4} {}", frame_n, score, verdict);
             }
         }
@@ -488,12 +563,20 @@ fn run_verify(args: &[String]) -> anyhow::Result<()> {
     })?;
 
     println!("{}", "-".repeat(32));
-    if best == f32::NEG_INFINITY {
-        println!("Best score: (no face detected)");
+    if !best.is_finite() {
+        println!("Best distance: (no face detected)");
     } else {
-        let verdict = if best >= threshold { "WOULD ALLOW" } else { "WOULD DENY" };
-        println!("Best score: {best:.4}  →  {verdict}  (threshold={threshold:.4})");
+        let verdict = if confirmed {
+            "WOULD ALLOW"
+        } else {
+            "WOULD DENY"
+        };
+        println!("Best distance: {best:.4}  →  {verdict}  (threshold={threshold:.4})");
     }
+    anyhow::ensure!(
+        confirmed,
+        "face verification failed: no consecutive matches"
+    );
     Ok(())
 }
 
@@ -540,13 +623,16 @@ fn run_enroll_verify(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    recognition::validate_threshold(threshold)?;
+    anyhow::ensure!(
+        enroll_frames > 0 && enroll_frames <= 100 && verify_frames > 0 && verify_frames <= 100,
+        "frame counts must be in 1..=100"
+    );
     let mut enroll_args = vec![
         "--user".to_string(),
         username.clone(),
         "--frames".to_string(),
         enroll_frames.to_string(),
-        "--threshold".to_string(),
-        threshold.to_string(),
     ];
     if replace {
         enroll_args.push("--replace".to_string());
@@ -595,11 +681,7 @@ fn run_setup(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
-    let mut onboard_args = vec![
-        "--user".to_string(),
-        username,
-        "--replace".to_string(),
-    ];
+    let mut onboard_args = vec!["--user".to_string(), username, "--replace".to_string()];
     if let Some(device) = &device {
         onboard_args.push("--device".to_string());
         onboard_args.push(device.display().to_string());
@@ -610,6 +692,10 @@ fn run_setup(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn print_usage() {
+    println!("  face-authd benchmark --device PATH --frames 40 --json REPORT.json  Live, in-memory reference/verification test");
+    println!(
+        "  face-authd fetch-models  Download pinned and verified models (explicit network access)"
+    );
     println!("Usage:");
     println!("  face-authd                         Run the local authentication daemon");
     println!("  face-authd setup                   Quick setup (enroll + verify, recommended)");
@@ -631,7 +717,9 @@ fn print_usage() {
     println!("  --device PATH    IR camera device (default: auto-detect GREY device)");
     println!("  --frames N       Number of face samples to collect (default: 5)");
     println!("  --replace        Overwrite existing enrollment for this user");
-    println!("  --threshold F    Min match score 0..1 (default: 0.6)");
+    println!(
+        "  --threshold F    Max normalized SFace L2 distance in (0, 1.128] (lower is stricter; default: 1.128)"
+    );
     println!("  --verify-frames N  (enroll-verify only) verification frames (default: 10)");
     println!();
     print_preview_usage();
@@ -752,16 +840,13 @@ impl eframe::App for PreviewApp {
         // Drain all pending frames, keep the latest
         while let Ok(f) = self.rx.try_recv() {
             let image = egui::ColorImage::from_rgb([f.width, f.height], &f.rgb);
-            self.texture = Some(ctx.load_texture(
-                "camera",
-                image,
-                egui::TextureOptions::NEAREST,
-            ));
+            self.texture = Some(ctx.load_texture("camera", image, egui::TextureOptions::NEAREST));
             // Resize window to match camera resolution on first frame
             if !self.sized_to_frame || self.frame_w != f.width || self.frame_h != f.height {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                    egui::vec2(f.width as f32, f.height as f32),
-                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    f.width as f32,
+                    f.height as f32,
+                )));
                 self.sized_to_frame = true;
             }
             self.frame_w = f.width;
@@ -779,22 +864,21 @@ impl eframe::App for PreviewApp {
                 // Draw detection overlays with egui painter
                 if self.frame_w > 0 && self.frame_h > 0 {
                     let r = resp.rect;
-                    let sx = r.width()  / self.frame_w as f32;
+                    let sx = r.width() / self.frame_w as f32;
                     let sy = r.height() / self.frame_h as f32;
                     let painter = ui.painter();
 
                     for det in &self.detections {
                         let x0 = r.left() + det.x * sx;
-                        let y0 = r.top()  + det.y * sy;
+                        let y0 = r.top() + det.y * sy;
                         let x1 = x0 + det.w * sx;
                         let y1 = y0 + det.h * sy;
-                        let drect = egui::Rect::from_min_max(
-                            egui::pos2(x0, y0), egui::pos2(x1, y1),
-                        );
+                        let drect =
+                            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
                         painter.rect_stroke(
                             drect,
                             egui::Rounding::ZERO,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 0)),
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 80, 0)),
                         );
                         painter.text(
                             egui::pos2(x0 + 2.0, y0 + 2.0),
@@ -880,7 +964,10 @@ fn run_preview(args: &[String]) -> anyhow::Result<()> {
             .iter()
             .find(|d| d.path == path || d.symlinks.iter().any(|link| link == &path))
             .cloned()
-            .map(|mut d| { d.path = path.clone(); d })
+            .map(|mut d| {
+                d.path = path.clone();
+                d
+            })
             .unwrap_or(camera::VideoDeviceInfo {
                 path,
                 symlinks: Vec::new(),
@@ -905,7 +992,7 @@ fn run_preview(args: &[String]) -> anyhow::Result<()> {
                         && d.supports_streaming
                         && matches!(d.fourcc.as_str(), "GREY" | "Y8")
                 })
-                .or_else(|| fallback.as_ref())
+                .or(fallback.as_ref())
                 .cloned()
                 .context("no suitable preview camera found; use --device")?
         }
@@ -913,7 +1000,12 @@ fn run_preview(args: &[String]) -> anyhow::Result<()> {
     let ir_device = selected.path.clone();
     println!("Preview device: {}", ir_device.display());
 
-    let config = CaptureConfig { width, height, fourcc, ..CaptureConfig::default() };
+    let config = CaptureConfig {
+        width,
+        height,
+        fourcc,
+        ..CaptureConfig::default()
+    };
 
     // Channel: camera thread → GUI thread
     let (tx, rx) = std::sync::mpsc::channel::<PreviewFrame>();
@@ -923,7 +1015,10 @@ fn run_preview(args: &[String]) -> anyhow::Result<()> {
         let mut detector: Option<FaceDetector> = if detect {
             match load_face_detector_blocking() {
                 Ok(d) => Some(d),
-                Err(e) => { eprintln!("detector load failed: {e}"); None }
+                Err(e) => {
+                    eprintln!("detector load failed: {e}");
+                    None
+                }
             }
         } else {
             None
@@ -935,18 +1030,21 @@ fn run_preview(args: &[String]) -> anyhow::Result<()> {
 
             let detections = match detector.as_mut() {
                 Some(d) => d.detect(&gray).unwrap_or_default(),
-                None    => vec![],
+                None => vec![],
             };
 
             // Grayscale → RGB24
             let rgb: Vec<u8> = gray.pixels.iter().flat_map(|&p| [p, p, p]).collect();
 
-            if tx.send(PreviewFrame {
-                rgb,
-                width:  gray.width  as usize,
-                height: gray.height as usize,
-                detections,
-            }).is_err() {
+            if tx
+                .send(PreviewFrame {
+                    rgb,
+                    width: gray.width as usize,
+                    height: gray.height as usize,
+                    detections,
+                })
+                .is_err()
+            {
                 // Receiver dropped (window closed)
                 return Ok(StreamControl::Stop);
             }
@@ -981,7 +1079,8 @@ fn run_preview(args: &[String]) -> anyhow::Result<()> {
                 sized_to_frame: false,
             }))
         }),
-    ).map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;
 
     Ok(())
 }
@@ -1043,8 +1142,8 @@ fn collect_usb_interface_details(usb_root: &Path) -> anyhow::Result<Vec<String>>
     lines.push(format!("usb-root={}", usb_root.display()));
 
     let mut interfaces = Vec::new();
-    for entry in fs::read_dir(usb_root)
-        .with_context(|| format!("failed to read {}", usb_root.display()))?
+    for entry in
+        fs::read_dir(usb_root).with_context(|| format!("failed to read {}", usb_root.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -1139,23 +1238,28 @@ fn run_enroll(args: &[String]) -> anyhow::Result<()> {
             "--replace" => {
                 replace_existing = true;
             }
-            "--threshold" => {
-                let _det_threshold: f32 = iter
-                    .next()
-                    .context("--threshold requires a value")?
-                    .parse()
-                    .context("--threshold must be a float")?;
-            }
             other => anyhow::bail!("unknown enroll argument: {other}"),
         }
     }
 
+    anyhow::ensure!(
+        target_frames > 0 && target_frames <= 100,
+        "--frames must be in 1..=100"
+    );
     println!("Enrolling user: {username}");
 
+    anyhow::ensure!(
+        common::protocol::valid_username(&username),
+        "invalid username"
+    );
     // Ensure enrollment dir is accessible
     let enroll_dir = enrollment_dir();
-    check_enrollment_dir(&enroll_dir)
-        .with_context(|| format!("enrollment directory {} is not usable", enroll_dir.display()))?;
+    check_enrollment_dir(&enroll_dir).with_context(|| {
+        format!(
+            "enrollment directory {} is not usable",
+            enroll_dir.display()
+        )
+    })?;
 
     if !replace_existing && load_enrollment(&username)?.is_some() {
         anyhow::bail!(
@@ -1169,35 +1273,23 @@ fn run_enroll(args: &[String]) -> anyhow::Result<()> {
     let devices = discover_video_devices()?;
     let ir_device = match device {
         Some(ref p) => p.clone(),
-        None => {
-            let preferred = preferred_device_from_env();
-            let fallback = select_capture_device(&devices, preferred.as_deref());
-            let found = devices
-                .iter()
-                .find(|d| d.supports_capture && d.supports_streaming
-                    && matches!(d.fourcc.as_str(), "GREY" | "Y8"))
-                .or_else(|| fallback.as_ref())
-                .map(|d| d.path.clone())
-                .context("no suitable camera found; use --device")?;
-            found
-        }
+        None => camera::select_auth_device(&devices)?.path,
     };
     println!("IR camera: {}", ir_device.display());
 
-    // Load models (may trigger download)
+    // Load pinned, locally verified models
     println!("Loading recognition models...");
     let mut recognizer =
         load_face_recognizer_blocking().context("failed to load face recognition models")?;
     println!("Models ready.");
+    emitter::emitter_from_env().activate(Some(&ir_device))?;
 
-    let cap_config = CaptureConfig::default();
+    let cap_config = camera::auth_capture_config();
     let mut collected: Vec<Vec<f32>> = Vec::new();
     let mut attempt = 0usize;
     let max_attempts = target_frames * 10;
 
-    println!(
-        "Position your face in front of the IR camera. Collecting {target_frames} samples..."
-    );
+    println!("Position your face in front of the IR camera. Collecting {target_frames} samples...");
 
     stream_frames(&ir_device, &cap_config, 2, |frame| {
         if collected.len() >= target_frames || attempt >= max_attempts {
@@ -1205,7 +1297,7 @@ fn run_enroll(args: &[String]) -> anyhow::Result<()> {
         }
         attempt += 1;
 
-        let gray = match decode_to_grayscale(&frame) {
+        let gray = match camera::decode_to_bgr(&frame) {
             Ok(g) => g,
             Err(err) => {
                 eprintln!("  decode error: {err}");
@@ -1233,9 +1325,8 @@ fn run_enroll(args: &[String]) -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(150));
         Ok(StreamControl::Continue)
     })
-    .or_else(|err| {
+    .inspect_err(|err| {
         eprintln!("  capture error: {err}");
-        Err(err)
     })?;
 
     if collected.len() < target_frames {
@@ -1247,6 +1338,7 @@ fn run_enroll(args: &[String]) -> anyhow::Result<()> {
     }
 
     let enrollment = UserEnrollment {
+        model_id: recognition::enrollment::MODEL_ID.to_string(),
         username: username.clone(),
         embeddings: collected,
     };
@@ -1330,13 +1422,29 @@ async fn handle_client(
     provider: Arc<dyn FaceAuthProvider>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    let mut reader = BufReader::new(reader).take((MAX_MESSAGE_BYTES + 1) as u64);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let bytes = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line)).await??;
+    anyhow::ensure!(
+        bytes > 0 && bytes <= MAX_MESSAGE_BYTES && line.ends_with('\n'),
+        "invalid or oversized request frame"
+    );
 
     let response = match serde_json::from_str::<Request>(&line) {
         Ok(Request::Ping) => Response::Pong,
-        Ok(Request::Authenticate(req)) => authenticate(provider.as_ref(), req).await,
+        Ok(Request::Authenticate(req)) => {
+            // The protocol is one request per connection. PAM keeps its write
+            // side open while waiting; EOF or extra input cancels the request.
+            let mut extra = [0u8; 1];
+            tokio::select! {
+                biased;
+                response = authenticate(provider.as_ref(), req) => response,
+                result = reader.read(&mut extra) => {
+                    result?;
+                    anyhow::bail!("authentication client disconnected or sent extra input");
+                }
+            }
+        }
         Err(err) => Response::Error(ErrorResponse {
             code: "bad_request".to_string(),
             message: err.to_string(),
@@ -1344,8 +1452,11 @@ async fn handle_client(
     };
 
     let payload = encode_response(&response)?;
-    writer.write_all(&payload).await?;
-    writer.flush().await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        writer.write_all(&payload).await?;
+        writer.flush().await
+    })
+    .await??;
     Ok(())
 }
 
@@ -1357,6 +1468,12 @@ async fn authenticate(provider: &dyn FaceAuthProvider, req: AuthenticateRequest)
         });
     }
 
+    if let Err(message) = req.validate() {
+        return Response::Error(ErrorResponse {
+            code: "request_denied".into(),
+            message: message.into(),
+        });
+    }
     info!(
         username = req.username,
         service = req.service.as_deref().unwrap_or("unknown"),
@@ -1384,5 +1501,138 @@ async fn authenticate(provider: &dyn FaceAuthProvider, req: AuthenticateRequest)
             code: "provider_error".to_string(),
             message,
         }),
+    }
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct TestProvider(AtomicUsize);
+    impl FaceAuthProvider for TestProvider {
+        fn authenticate<'a>(&'a self, _: &'a AuthenticateRequest) -> provider::ProviderFuture<'a> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                AuthDecision::Deny {
+                    reason: Some("test provider".into()),
+                }
+            })
+        }
+    }
+    fn provider() -> Arc<TestProvider> {
+        Arc::new(TestProvider(AtomicUsize::new(0)))
+    }
+    async fn exchange(payload: &[u8], provider: Arc<TestProvider>) -> anyhow::Result<Vec<u8>> {
+        let (server, mut client) = UnixStream::pair()?;
+        let task = tokio::spawn(handle_client(server, provider));
+        client.write_all(payload).await?;
+        client.shutdown().await?;
+        let mut result = Vec::new();
+        client.read_to_end(&mut result).await?;
+        task.await??;
+        Ok(result)
+    }
+    #[tokio::test]
+    async fn ping_and_denied_requests_do_not_access_camera() {
+        let p = provider();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(
+                &exchange(b"{\"type\":\"ping\"}\n", p.clone()).await.unwrap()
+            )
+            .unwrap(),
+            Response::Pong
+        ));
+        for (version, service, rhost) in [
+            (2, "sudo", None),
+            (1, "sshd", None),
+            (1, "sudo", Some("remote")),
+        ] {
+            let request = Request::Authenticate(AuthenticateRequest {
+                version,
+                username: "alice".into(),
+                service: Some(service.into()),
+                tty: None,
+                rhost: rhost.map(String::from),
+            });
+            let bytes = common::protocol::encode_request(&request).unwrap();
+            let response = exchange(&bytes, p.clone()).await.unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Response>(&response).unwrap(),
+                Response::Error(_)
+            ));
+        }
+        assert_eq!(p.0.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn oversized_and_incomplete_frames_are_rejected() {
+        let p = provider();
+        assert!(exchange(&vec![b'x'; MAX_MESSAGE_BYTES + 1], p.clone())
+            .await
+            .is_err());
+        assert!(exchange(b"{\"type\":\"ping\"}", p.clone()).await.is_err());
+        assert_eq!(p.0.load(Ordering::Relaxed), 0);
+    }
+    #[tokio::test]
+    async fn disconnect_drops_in_progress_authentication() {
+        use std::sync::atomic::AtomicBool;
+        struct PendingProvider {
+            started: tokio::sync::Notify,
+            cancelled: Arc<AtomicBool>,
+        }
+        struct FlagOnDrop(Arc<AtomicBool>);
+        impl Drop for FlagOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        impl FaceAuthProvider for PendingProvider {
+            fn authenticate<'a>(
+                &'a self,
+                _: &'a AuthenticateRequest,
+            ) -> provider::ProviderFuture<'a> {
+                Box::pin(async move {
+                    let _guard = FlagOnDrop(self.cancelled.clone());
+                    self.started.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }
+        let p = Arc::new(PendingProvider {
+            started: tokio::sync::Notify::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_client(server, p.clone()));
+        let req = Request::Authenticate(AuthenticateRequest {
+            version: PROTOCOL_VERSION,
+            username: "alice".into(),
+            service: Some("sudo".into()),
+            tty: None,
+            rhost: None,
+        });
+        client
+            .write_all(&common::protocol::encode_request(&req).unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), p.started.notified())
+            .await
+            .unwrap();
+        drop(client);
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(p.cancelled.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn stalled_client_expires() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), handle_client(server, provider()))
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 }
