@@ -1,0 +1,6 @@
+YuNet and SFace model files are downloaded from the OpenCV model zoo.
+Pinned upstream: https://github.com/opencv/opencv_zoo/commit/48b10fa505aeb51fbd127fc60a5c660040e823b7
+YuNet: models/face_detection_yunet/face_detection_yunet_2023mar.onnx (MIT)
+SFace: models/face_recognition_sface/face_recognition_sface_2021dec.onnx (Apache-2.0)
+The accompanying license texts must be included when redistributing these weights.
+The Rust project license does not replace third-party licenses.

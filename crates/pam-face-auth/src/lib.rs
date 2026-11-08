@@ -1,18 +1,18 @@
 use std::ffi::{CStr, CString};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::time::Duration;
 
 use common::protocol::{
     encode_request, AuthenticateRequest, AuthenticateResponse, Request, Response,
-    DEFAULT_SOCKET_PATH, PROTOCOL_VERSION,
+    DEFAULT_SOCKET_PATH, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use libc::{c_char, c_int};
 use pam_sys::{
-    pam_conv, pam_get_item, pam_get_user, pam_handle_t, pam_message, pam_response,
-    PAM_AUTH_ERR, PAM_CONV, PAM_CONV_ERR, PAM_RHOST, PAM_SERVICE, PAM_SERVICE_ERR,
-    PAM_SUCCESS, PAM_SYSTEM_ERR, PAM_TEXT_INFO, PAM_TTY, PAM_USER_UNKNOWN,
+    pam_conv, pam_get_item, pam_get_user, pam_handle_t, pam_message, pam_response, PAM_AUTH_ERR,
+    PAM_CONV, PAM_CONV_ERR, PAM_RHOST, PAM_SERVICE, PAM_SERVICE_ERR, PAM_SUCCESS, PAM_SYSTEM_ERR,
+    PAM_TEXT_INFO, PAM_TTY, PAM_USER_UNKNOWN,
 };
 
 type PamResultCode = i32;
@@ -84,6 +84,21 @@ fn daemon_authenticate(
     request: &AuthenticateRequest,
 ) -> Result<AuthenticateResponse, PamResultCode> {
     let mut stream = UnixStream::connect(DEFAULT_SOCKET_PATH).map_err(|_| PAM_SERVICE_ERR)?;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    use std::os::fd::AsRawFd;
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut size,
+        )
+    };
+    if status != 0 || cred.uid != 0 {
+        return Err(PAM_SERVICE_ERR);
+    }
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(|_| PAM_SYSTEM_ERR)?;
@@ -102,9 +117,12 @@ fn daemon_authenticate(
 
     stream.write_all(&payload).map_err(|_| PAM_SERVICE_ERR)?;
 
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take((MAX_MESSAGE_BYTES + 1) as u64);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|_| PAM_SERVICE_ERR)?;
+    let bytes = reader.read_line(&mut line).map_err(|_| PAM_SERVICE_ERR)?;
+    if bytes == 0 || bytes > MAX_MESSAGE_BYTES || !line.ends_with('\n') {
+        return Err(PAM_SERVICE_ERR);
+    }
 
     match serde_json::from_str::<Response>(&line).map_err(|_| PAM_SYSTEM_ERR)? {
         Response::Authenticate(resp) => Ok(resp),
@@ -113,6 +131,10 @@ fn daemon_authenticate(
     }
 }
 
+/// PAM credential hook (no credentials are changed).
+///
+/// # Safety
+/// Called by PAM using its module ABI; no pointer arguments are dereferenced.
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_setcred(
     _pamh: *mut pam_handle_t,
@@ -123,6 +145,11 @@ pub unsafe extern "C" fn pam_sm_setcred(
     PAM_SUCCESS
 }
 
+/// Authenticate an account through the privileged local daemon.
+///
+/// # Safety
+/// `pamh` must be a valid PAM handle and its registered conversation callback
+/// must obey the PAM ABI for the duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_authenticate(
     pamh: *mut pam_handle_t,
@@ -130,7 +157,10 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> PamResultCode {
-    let _ = pam_text_info(pamh, "Face authentication in progress. Look at the IR camera...");
+    let _ = pam_text_info(
+        pamh,
+        "Face authentication in progress. Look at the IR camera...",
+    );
 
     let username = match pam_get_username(pamh) {
         Ok(username) => username,

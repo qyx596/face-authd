@@ -1,10 +1,14 @@
-# /etc/pam.d/sudo 示例
-#
-# 建议先将人脸认证设置为 sufficient 或者 optional，
-# 确认稳定后再决定是否改成 required。
-
-auth sufficient pam_face_auth.so
+# Example for Arch Linux stock system-auth (with pam_faillock).
+# Review the existing stack first; these guards are not a generic distro preset.
+# Preserve password fallback and the account/session rules from the original file.
+# preauth prevents face authentication from bypassing an account lock.
+auth requisite pam_faillock.so preauth silent
+auth [success=1 default=ignore] pam_face_auth.so
+# Failed face authentication skips authsucc and reaches the original password stack.
+auth [default=1] pam_permit.so
+auth sufficient pam_faillock.so authsucc
 auth include system-auth
 
 account include system-auth
 session include system-auth
+session optional pam_systemd.so class=none
